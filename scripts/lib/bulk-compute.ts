@@ -17,6 +17,35 @@ import type { Dem } from "./dem";
 const START_HALF_M = 500.0;
 const MAX_HALF_M = 32_000.0;
 
+// At a fixed 10 m step (buildGrid's default), a half-width above this holds
+// a multi-million-node elevation grid — tens to hundreds of MB per summit,
+// as plain JS number[][], not numpy's tight float64 buffers. Flat desert
+// terrain (e.g. Nevada's Basin and Range) widens this far routinely, and
+// several of those running at once under --concurrency is what blew a
+// bulk-az run past Node's heap limit (OOM after ~2150/7433 summits on a
+// W7N/W7O/W7W run). Bound how many such grids exist at once, independent
+// of overall pool concurrency: small summits stay fully parallel, big ones
+// serialize down to a handful in flight.
+const LARGE_GRID_HALF_M = 4000.0;
+const MAX_CONCURRENT_LARGE_GRIDS = 1;
+
+let largeGridsInFlight = 0;
+const largeGridWaiters: (() => void)[] = [];
+
+async function acquireLargeGridSlot(): Promise<void> {
+  if (largeGridsInFlight < MAX_CONCURRENT_LARGE_GRIDS) {
+    largeGridsInFlight++;
+    return;
+  }
+  await new Promise<void>((resolve) => largeGridWaiters.push(resolve));
+  largeGridsInFlight++;
+}
+
+function releaseLargeGridSlot(): void {
+  largeGridsInFlight--;
+  largeGridWaiters.shift()?.();
+}
+
 export interface BulkResult {
   ok: boolean;
   ring?: number[][];
@@ -44,9 +73,19 @@ export async function computeOneLocal(
     while (true) {
       const dlat = half / 111320.0;
       const dlon = half / (111320.0 * Math.cos((lat * Math.PI) / 180));
-      const { nodeLat, nodeLon } = buildGrid(lat, [lon - dlon, lat - dlat, lon + dlon, lat + dlat]);
-      const V = await dem.grid(nodeLat, nodeLon);
-      ring = ringFromGrid(lat, lon, alt, nodeLat, nodeLon, V);
+      const large = half > LARGE_GRID_HALF_M;
+      if (large) await acquireLargeGridSlot();
+      let nodeLat: number[];
+      let nodeLon: number[];
+      try {
+        const grid = buildGrid(lat, [lon - dlon, lat - dlat, lon + dlon, lat + dlat]);
+        nodeLat = grid.nodeLat;
+        nodeLon = grid.nodeLon;
+        const V = await dem.grid(nodeLat, nodeLon);
+        ring = ringFromGrid(lat, lon, alt, nodeLat, nodeLon, V);
+      } finally {
+        if (large) releaseLargeGridSlot();
+      }
       if (half >= MAX_HALF_M || (ring !== null && !touchesEdge(ring, nodeLat, nodeLon))) break;
       half *= 2;
     }

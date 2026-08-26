@@ -16,13 +16,6 @@ export const NODATA_SENTINEL = -1e9; // matches src/az/compute.ts's null-elevati
 
 export class TileMissing extends Error {}
 
-interface Point {
-  i: number;
-  j: number;
-  lat: number;
-  lon: number;
-}
-
 export class Dem {
   private images = new Map<string, Promise<GeoTIFFImage | null>>();
 
@@ -53,27 +46,36 @@ export class Dem {
    * src/az/compute.ts's fetchElevations return: rows follow nodeLat, cols
    * follow nodeLon. */
   async grid(nodeLat: number[], nodeLon: number[]): Promise<number[][]> {
-    const out: number[][] = nodeLat.map(() => new Array<number>(nodeLon.length).fill(NODATA_SENTINEL));
+    const width = nodeLon.length;
+    const out: number[][] = nodeLat.map(() => new Array<number>(width).fill(NODATA_SENTINEL));
 
-    const byTile = new Map<string, Point[]>();
+    // Bucket by tile using flat numeric indices (i * width + j) rather than
+    // one {i,j,lat,lon} object per point: for the multi-million-node grids
+    // that scripts/lib/bulk-compute.ts's adaptive widening produces on flat
+    // terrain, an object per point costs 6-8x what the point itself is
+    // worth and was enough on its own to exhaust a bulk-az.ts run's heap.
+    // sample() reconstructs lat/lon/i/j from the index on demand.
+    const byTile = new Map<string, number[]>();
     for (let i = 0; i < nodeLat.length; i++) {
-      for (let j = 0; j < nodeLon.length; j++) {
-        const name = Dem.tileName(nodeLat[i]!, nodeLon[j]!);
-        const pts = byTile.get(name);
-        const pt = { i, j, lat: nodeLat[i]!, lon: nodeLon[j]! };
-        if (pts) pts.push(pt);
-        else byTile.set(name, [pt]);
+      const lat = nodeLat[i]!;
+      for (let j = 0; j < width; j++) {
+        const name = Dem.tileName(lat, nodeLon[j]!);
+        const idx = i * width + j;
+        const list = byTile.get(name);
+        if (list) list.push(idx);
+        else byTile.set(name, [idx]);
       }
     }
 
     let gotAny = false;
-    for (const [name, pts] of byTile) {
+    for (const [name, idxs] of byTile) {
       const image = await this.getImage(name);
       if (!image) continue;
-      const vals = await this.sample(image, pts);
-      for (let k = 0; k < pts.length; k++) {
+      const vals = await this.sample(image, idxs, nodeLat, nodeLon, width);
+      for (let k = 0; k < idxs.length; k++) {
         const v = vals[k]!;
-        out[pts[k]!.i]![pts[k]!.j] = v;
+        const idx = idxs[k]!;
+        out[Math.floor(idx / width)]![idx % width] = v;
         if (v > -1e8) gotAny = true;
       }
     }
@@ -81,23 +83,34 @@ export class Dem {
     return out;
   }
 
-  /** Bilinear sample at each point; matches the old dem.py's Dem._sample. */
-  private async sample(image: GeoTIFFImage, pts: Point[]): Promise<number[]> {
+  /** Bilinear sample at each point; matches the old dem.py's Dem._sample.
+   * `idxs` are flat `i * width + j` indices into the nodeLat x nodeLon
+   * mesh, not point objects — see the comment in grid(). */
+  private async sample(
+    image: GeoTIFFImage,
+    idxs: number[],
+    nodeLat: number[],
+    nodeLon: number[],
+    width: number,
+  ): Promise<number[]> {
     const [minX, minY, maxX, maxY] = image.getBoundingBox();
-    const width = image.getWidth();
-    const height = image.getHeight();
+    const imgWidth = image.getWidth();
+    const imgHeight = image.getHeight();
     // Affine transform, top-left origin: (c, f) is the top-left corner,
     // (a, e) are pixel width/height (e negative since rows increase south).
-    const a = (maxX! - minX!) / width;
-    const e = -(maxY! - minY!) / height;
+    const a = (maxX! - minX!) / imgWidth;
+    const e = -(maxY! - minY!) / imgHeight;
     const c = minX!;
     const f = maxY!;
     const nodata = image.getGDALNoData() ?? -999999;
 
-    const cols = pts.map((p) => (p.lon - c) / a - 0.5);
-    const rows = pts.map((p) => (p.lat - f) / e - 0.5);
-    const r0 = rows.map((r) => Math.min(Math.max(Math.floor(r), 0), height - 2));
-    const c0 = cols.map((cc) => Math.min(Math.max(Math.floor(cc), 0), width - 2));
+    const lat = (idx: number) => nodeLat[Math.floor(idx / width)]!;
+    const lon = (idx: number) => nodeLon[idx % width]!;
+
+    const cols = idxs.map((idx) => (lon(idx) - c) / a - 0.5);
+    const rows = idxs.map((idx) => (lat(idx) - f) / e - 0.5);
+    const r0 = rows.map((r) => Math.min(Math.max(Math.floor(r), 0), imgHeight - 2));
+    const c0 = cols.map((cc) => Math.min(Math.max(Math.floor(cc), 0), imgWidth - 2));
     const fr = rows.map((r, k) => Math.min(Math.max(r - r0[k]!, 0), 1));
     const fc = cols.map((cc, k) => Math.min(Math.max(cc - c0[k]!, 0), 1));
 
@@ -112,7 +125,7 @@ export class Dem {
     const band = (Array.isArray(rasters) ? rasters[0] : rasters) as unknown as ArrayLike<number>;
     const winWidth = window[2]! - window[0]!;
 
-    return pts.map((_, k) => {
+    return idxs.map((_, k) => {
       const rr = r0[k]! - minR;
       const cc = c0[k]! - minC;
       const v00 = band[rr * winWidth + cc]!;
