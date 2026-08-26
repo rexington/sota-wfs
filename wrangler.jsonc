@@ -1,0 +1,24 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "sota-wfs",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-25",
+  "observability": { "enabled": true },
+
+  "routes": [{ "pattern": "wfs.ke6mt.us", "custom_domain": true }],
+
+  "r2_buckets": [{ "binding": "DATA", "bucket_name": "sota-wfs-data" }],
+
+  "kv_namespaces": [{ "binding": "AZ_CACHE", "id": "4fbcffa59de945968a5f58f93e8cd496" }],
+
+  "durable_objects": {
+    "bindings": [{ "name": "AZ_QUEUE", "class_name": "AzQueueDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AzQueueDO"] }],
+
+  "triggers": {
+    // Daily SOTA summit list refresh (08:00 UTC), weekly Tesla Supercharger
+    // refresh (Mondays 09:00 UTC) — matches the old systemd timers' cadence.
+    "crons": ["0 8 * * *", "0 9 * * 1"]
+  }
+}

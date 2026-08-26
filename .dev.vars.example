@@ -1,0 +1,3 @@
+# Copy to .dev.vars (git-ignored) for `wrangler dev` local testing.
+# Production uses a real secret instead: `npx wrangler secret put NREL_API_KEY`.
+NREL_API_KEY=DEMO_KEY
