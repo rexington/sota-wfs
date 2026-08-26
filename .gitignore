@@ -1,13 +1,7 @@
-/data/
-*.tmp
-__pycache__/
-*.pyc
-.venv/
-*.egg-info/
-
 node_modules/
 .wrangler/
 worker-configuration.d.ts
 .dev.vars
 dist/
 coverage/
+*.tmp
