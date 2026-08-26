@@ -39,11 +39,13 @@ Cloudflare, reachable at a stable custom domain.
   `src/data/` — the real dataset (~171k rows) is what forced several of
   this project's design decisions (see git log).
 
+- `scripts/bulk-az.ts` — local bulk-precompute for AZ rings; see
+  [Bulk AZ precompute](#bulk-az-precompute) below.
+
 Not yet ported from the previous Python version: the offline
-bulk-precompute and SOTL.as-validation tools (`bulk_az`, `az_area`,
-`az_compare`). They never ran as part of the live service; the originals
-are still available in git history before the Cloudflare Workers
-migration.
+SOTL.as-validation tool (`az_compare`). It never ran as part of the live
+service; the original is still available in git history before the
+Cloudflare Workers migration.
 
 ## Layers served (namespace `sota`)
 
@@ -74,6 +76,45 @@ There's currently no automatic invalidation if a summit's official
 coordinates/altitude change in the SOTA database — a real gap, but a rare
 one (on the order of a handful of summits a year), and not yet worth the
 tooling.
+
+### Bulk AZ precompute
+
+The on-demand queue (`AzQueueDO`) is rate-limited to opentopodata's public
+budget (~1 req/s, 900 calls/day), so a summit you've never zoomed in on
+before can take a while to get its ring — and a whole under-visited region
+can outright exhaust the daily budget before working through its backlog.
+`scripts/bulk-az.ts` sidesteps this for a one-off backfill: it reads
+elevation directly from the public USGS 3DEP 1/3-arcsecond COGs on AWS via
+HTTP range requests (`scripts/lib/dem.ts`, using `geotiff.js` — no local
+DEM download, no server to run, no rate limit), computes rings locally, and
+writes straight into the real `AZ_CACHE` KV namespace. The live Worker
+then just serves what's already cached — no further computation needed.
+
+Only covers the continental US/Alaska (that's the 3DEP tileset's extent).
+Run it from your machine, not from a Worker:
+
+```sh
+npx tsx scripts/bulk-az.ts W6 W7O W7W [--limit N] [--concurrency N]
+```
+
+Notes:
+
+- Prefixes match the leading part of `SummitCode` (e.g. `W7` covers every
+  `W7*` region, `W7O` just that one). Pass as many as you like in one run.
+- Already-cached summits — success *or* a prior failure — are skipped, so
+  reruns are cheap and safe; only delete a KV entry first
+  (`npx wrangler kv key delete "az:<ref>" --namespace-id <id> --remote`) to
+  force a recompute.
+- `--concurrency` (default 8) is local HTTP range-request parallelism
+  against S3, unrelated to the live Worker's opentopodata budget — bump it
+  freely.
+- Takes a few ms/summit once DEM tiles are warm in the in-process cache;
+  sorted by DEM tile name first so neighboring summits hit the same tile
+  back-to-back. A run across a large, sparse region (thousands of summits)
+  still takes several minutes.
+- Requires `npx wrangler login` once (uses `wrangler kv key list`/
+  `bulk put` under the hood against the real namespace) — no `NREL_API_KEY`
+  or opentopodata access needed.
 
 ## Deployment
 
@@ -126,34 +167,96 @@ npx tsx scripts/measure-tiling.ts          # real-CSV diagnostic (network, no wr
 
 ## CalTopo integration
 
-Public URL (stable, custom domain): `https://wfs.ke6mt.us`
+Public URL (stable, custom domain — you'll paste this into CalTopo, nothing
+to install): `https://wfs.ke6mt.us`
 
-### Auto-configuration (Add → WFS Source → Auto-Configure URL)
+### What you'll see once it's added
 
-```
-https://wfs.ke6mt.us/geoserver/sota/wfs?service=WFS&version=2.0.0&request=GetCapabilities
-```
+- **SOTA summits** — one marker per summit, drawn as a numbered circle
+  colored by point value (green for 1-point summits up through red for
+  10-point summits, matching [SOTL.as](https://sotl.as)'s own color scale).
+  Clicking a summit shows its name, points, bonus points, activation count,
+  and a link to its SOTL.as page. Zoom in on a summit far enough that your
+  visible map spans less than about 25 miles (40 km) top-to-bottom and a
+  translucent orange **activation zone** ring appears — the area within 25
+  vertical meters of the true summit,
+  i.e. where you need to be standing to log a valid activation. That ring
+  is computed from elevation data the first time anyone views that summit
+  and cached forever after; if you're the first person to zoom in on a
+  given summit it can take a minute or two to show up — pan away and back,
+  or see [Troubleshooting](#troubleshooting) if it never does.
+- **Tesla Superchargers** — one marker per site; clicking it shows the
+  address, DC fast-charge stall count, top connector power, and access
+  hours.
 
-### Manual layer templates (Add → WFS Source → URL Template)
+Both layers refresh themselves automatically (summits daily, superchargers
+weekly) — there's nothing to re-add or re-sync later.
 
-SOTA summits, limited fields (label: `SummitName` or `SummitCode`):
+### Quick setup: add both layers at once (recommended)
+
+This is the easiest path and the one to use unless you specifically want to
+hand-pick which fields show in the popup (see Manual setup below).
+
+1. In CalTopo, open a map and use **Add → WFS Source**.
+2. Choose **Auto-Configure URL** and paste in:
+
+   ```
+   https://wfs.ke6mt.us/geoserver/sota/wfs?service=WFS&version=2.0.0&request=GetCapabilities
+   ```
+
+3. CalTopo reads that URL and offers both layers — **SOTA_Summits** and
+   **Tesla_Superchargers** — pre-filled with every available field. Add
+   whichever ones you want (or both).
+4. Each becomes a normal overlay layer on the map: toggle it on/off from
+   the layer list, and it'll only load/draw features inside your current
+   view (that's why panning or zooming can take a moment to populate —
+   CalTopo is asking the server for just what's on screen).
+
+### Manual setup: one URL per layer, with just the fields you want
+
+Use this if you want a specific field as the marker label (Auto-Configure
+always ends up using the feature ID), or you only want a subset of columns
+in the popup.
+
+1. In CalTopo, use **Add → WFS Source**, then choose **URL Template**
+   instead of Auto-Configure.
+2. Paste in one of the templates below, verbatim — CalTopo fills in
+   `{bottom}`,`{left}`,`{top}`,`{right}` itself as you pan/zoom.
+3. After adding, open the layer's settings and set **Label Name** to the
+   field you want shown on the map (suggested per layer below) — without
+   this, markers show a generic feature ID instead of a name.
+
+**SOTA summits, common fields** (set Label Name to `SummitName`):
 
 ```
 https://wfs.ke6mt.us/geoserver/wfs?SERVICE=WFS&VERSION=1.1.0&REQUEST=GetFeature&BBOX={bottom},{left},{top},{right}&OUTPUTFORMAT=application/json&TYPENAMES=sota:SOTA_Summits&PROPERTYNAME=SummitCode,SummitName,Points,BonusPoints,Activations,SOTLAS,the_geom
 ```
 
-SOTA summits, all fields: drop the `PROPERTYNAME` parameter.
+**SOTA summits, every field** (all 17 source columns plus SOTL.as link and
+activation count): same as above with the `&PROPERTYNAME=...` part removed
+entirely.
 
-Tesla Superchargers (label: `title`):
+**Tesla Superchargers** (set Label Name to `title`):
 
 ```
 https://wfs.ke6mt.us/geoserver/wfs?SERVICE=WFS&VERSION=1.1.0&REQUEST=GetFeature&BBOX={bottom},{left},{top},{right}&OUTPUTFORMAT=application/json&TYPENAMES=sota:Tesla_Superchargers&PROPERTYNAME=title,address,stalls,power_kw,access,the_geom
 ```
 
-Use "Save To Account" in the WFS Source dialog to make a layer available on
-every map (it appears under Your Data → Layers and in the "Your Overlays"
-list). Note each "Save To Account" click creates a new copy — prune old ones
-in Your Data → Layers (row → ⓘ → DELETE).
+Want more Supercharger fields in the popup (`street`, `city`, `state`,
+`zip`, `connectors`, `pricing`, `phone` are all available but omitted
+above to keep the popup short)? Add them to the `PROPERTYNAME` list,
+comma-separated, in any order.
+
+### Making a layer permanent
+
+Whichever setup path you used, the new layer only applies to the map you
+were editing until you save it. In the WFS Source dialog (or the layer's
+own settings afterward), use **Save To Account** to make it available on
+every map you open — it'll then show up under **Your Data → Layers** and
+in the **Your Overlays** picker on any map. Each "Save To Account" click
+creates a separate saved copy, so if you're experimenting with field
+choices, delete the old copy first (Your Data → Layers → row → ⓘ →
+DELETE) rather than accumulating duplicates.
 
 ## Verification
 
