@@ -29,6 +29,12 @@ const execFileAsync = promisify(execFile);
 const NAMESPACE_ID = process.env.CLOUDFLARE_KV_NAMESPACE_ID ?? "4fbcffa59de945968a5f58f93e8cd496";
 const FLUSH_BATCH = 250;
 const DEFAULT_CONCURRENCY = 8;
+// Node's execFile defaults to a 1 MB stdout buffer — comfortably exceeded by
+// `wrangler kv key list`'s pretty-printed JSON once a broad prefix (e.g.
+// "W", covering every already-cached W-association) lists tens of
+// thousands of entries. Even every SOTA summit worldwide (~171k) listed
+// this way is only a few MB, so this ceiling has generous headroom.
+const WRANGLER_MAX_BUFFER = 64 * 1024 * 1024;
 
 interface Args {
   prefixes: string[];
@@ -65,7 +71,7 @@ async function listCachedRefs(prefixes: string[]): Promise<Set<string>> {
       "--remote",
       "--prefix",
       `az:${prefix}`,
-    ]);
+    ], { maxBuffer: WRANGLER_MAX_BUFFER });
     const keys = JSON.parse(stdout) as { name: string }[];
     for (const { name } of keys) refs.add(name.slice("az:".length));
   }
@@ -78,7 +84,11 @@ async function flushToKv(entries: { key: string; value: string }[]): Promise<voi
   const file = path.join(dir, "batch.json");
   try {
     await writeFile(file, JSON.stringify(entries));
-    await execFileAsync("npx", ["wrangler", "kv", "bulk", "put", file, "--namespace-id", NAMESPACE_ID, "--remote"]);
+    await execFileAsync(
+      "npx",
+      ["wrangler", "kv", "bulk", "put", file, "--namespace-id", NAMESPACE_ID, "--remote"],
+      { maxBuffer: WRANGLER_MAX_BUFFER },
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
