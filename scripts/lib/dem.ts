@@ -101,10 +101,12 @@ export class Dem {
     const fr = rows.map((r, k) => Math.min(Math.max(r - r0[k]!, 0), 1));
     const fc = cols.map((cc, k) => Math.min(Math.max(cc - c0[k]!, 0), 1));
 
-    const minR = Math.min(...r0);
-    const maxR = Math.max(...r0);
-    const minC = Math.min(...c0);
-    const maxC = Math.max(...c0);
+    // Plain loops, not Math.min(...arr): a spread call blows the stack once
+    // an oversized (e.g. adaptively-widened flat-terrain) grid puts tens of
+    // thousands of points in one tile.
+    let minR = Infinity, maxR = -Infinity, minC = Infinity, maxC = -Infinity;
+    for (const v of r0) { if (v < minR) minR = v; if (v > maxR) maxR = v; }
+    for (const v of c0) { if (v < minC) minC = v; if (v > maxC) maxC = v; }
     const window = [minC, minR, maxC + 2, maxR + 2];
     const rasters = await image.readRasters({ window });
     const band = (Array.isArray(rasters) ? rasters[0] : rasters) as unknown as ArrayLike<number>;

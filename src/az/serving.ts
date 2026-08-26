@@ -69,9 +69,18 @@ export async function writeCache(kv: KVNamespace, ref: string, entry: AzCacheEnt
   await kv.put(azKey(ref), JSON.stringify({ ...entry, ts: entry.ts ?? Date.now() }));
 }
 
+function ringBbox(ring: number[][]): [number, number, number, number] {
+  let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+  for (const [x, y] of ring) {
+    if (x! < minx) minx = x!;
+    if (x! > maxx) maxx = x!;
+    if (y! < miny) miny = y!;
+    if (y! > maxy) maxy = y!;
+  }
+  return [minx, miny, maxx, maxy];
+}
+
 function feature(ref: string, record: FeatureRecord, ring: number[][], baseUrl: string): GeoJsonFeature {
-  const lons = ring.map((p) => p[0]!);
-  const lats = ring.map((p) => p[1]!);
   const name = record.props.SummitName;
   return {
     type: "Feature",
@@ -90,7 +99,7 @@ function feature(ref: string, record: FeatureRecord, ring: number[][], baseUrl: 
       fill: AZ_COLOR,
       "fill-opacity": 0.1,
     },
-    bbox: [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)],
+    bbox: ringBbox(ring),
   };
 }
 

@@ -167,9 +167,14 @@ export function select(
   };
 
   if (bboxSource.length > 0) {
-    const xs = bboxSource.map((f) => f.bbox[0]).concat(bboxSource.map((f) => f.bbox[2]));
-    const ys = bboxSource.map((f) => f.bbox[1]).concat(bboxSource.map((f) => f.bbox[3]));
-    fc.bbox = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+    let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+    for (const f of bboxSource) {
+      if (f.bbox[0] < minx) minx = f.bbox[0];
+      if (f.bbox[2] > maxx) maxx = f.bbox[2];
+      if (f.bbox[1] < miny) miny = f.bbox[1];
+      if (f.bbox[3] > maxy) maxy = f.bbox[3];
+    }
+    fc.bbox = [minx, miny, maxx, maxy];
   }
   return fc;
 }
