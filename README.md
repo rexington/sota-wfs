@@ -10,161 +10,6 @@ that and nothing more. There is no origin server to keep running, no
 tunnel, no local machine: fetch, storage, and serving all run on
 Cloudflare, reachable at a stable custom domain.
 
-## Components
-
-- `src/index.ts` — Hono app: `/geoserver` WFS routes (`GetCapabilities`,
-  `GetFeature`, `DescribeFeatureType`), plus `/summit/<ref>.geojson` and
-  `/az/<ref>.geojson` single-record downloads.
-- `src/scheduled.ts` — Cron Trigger handler: fetches and validates the SOTA
-  summit list (daily) and Tesla Supercharger locations (weekly), then
-  publishes them. A bad fetch (wrong header, too few rows/features) is
-  never published — the previous good data keeps serving.
-- **R2** (`sota-wfs-data` bucket) — each publish writes a new version's
-  worth of bbox-tiled data (5°×5° tiles, `src/data/tiling.ts`) plus a
-  compact `code → tile` lookup index, under a fresh version prefix;
-  `current.json` is flipped last so a `GetFeature` request never observes a
-  half-written generation. Two generations back are pruned automatically.
-  A `GetFeature` with a BBOX (which is what CalTopo always sends) only
-  reads the handful of tiles the view overlaps — never the whole dataset.
-- **KV** (`AZ_CACHE` namespace) — one key per summit's cached activation-zone
-  ring. Computed once, served forever; see [Activation zones](#activation-zones-az)
-  below.
-- **Durable Object** (`AzQueueDO`) — the single global coordinator for AZ
-  polygon computation: a rate-limited (~1 req/s), daily-budgeted (900
-  calls) queue driven by alarms, replacing what used to be an in-process
-  thread in the old Python version.
-- `scripts/measure-tiling.ts` — local diagnostic: fetches the real SOTA CSV
-  and reports tile counts/sizes and a few data-shape sanity checks. Run
-  with `npx tsx scripts/measure-tiling.ts` before changing anything in
-  `src/data/` — the real dataset (~171k rows) is what forced several of
-  this project's design decisions (see git log).
-
-- `scripts/bulk-az.ts` — local bulk-precompute for AZ rings; see
-  [Bulk AZ precompute](#bulk-az-precompute) below.
-
-Not yet ported from the previous Python version: the offline
-SOTL.as-validation tool (`az_compare`). It never ran as part of the live
-service; the original is still available in git history before the
-Cloudflare Workers migration.
-
-## Layers served (namespace `sota`)
-
-| Typename | Fields (popup subset in bold) |
-|---|---|
-| `sota:SOTA_Summits` | All 17 summit-list columns plus **`SOTLAS`** (link to <https://sotl.as>) and **`Activations`** (activation count as a string, so "0" still displays) |
-| `sota:Tesla_Superchargers` | **`title`**, **`address`**, **`stalls`**, **`power_kw`**, **`access`**, plus `street`, `city`, `state`, `zip`, `connectors`, `pricing`, `phone` |
-
-Supercharger field notes: `stalls` = DC fast-charge stall count, `power_kw` =
-highest connector power at the site, `access` = hours plus NACS notes. The
-extra columns are served but omitted from the CalTopo templates below — any
-future template can re-include them via `PROPERTYNAME` without code changes.
-
-### Activation zones (AZ)
-
-SOTA summit points can carry an AZ polygon (the area within 25 vertical
-meters of the summit). Rings are computed from a coarse bound
-(api.activation.zone) plus a fine elevation grid (opentopodata), and are
-**only ever computed once per summit**: a successful ring is cached in KV
-permanently and never recomputed, since a summit's terrain doesn't change.
-A failed computation is retried after 7 days. Polygons are only served
-when the map is zoomed in enough (bbox lat span < 0.4°); a cache miss is
-queued to `AzQueueDO` and appears on a later pan/refresh — never computed
-synchronously in the request path, since the elevation API is slow and
-rate-limited.
-
-There's currently no automatic invalidation if a summit's official
-coordinates/altitude change in the SOTA database — a real gap, but a rare
-one (on the order of a handful of summits a year), and not yet worth the
-tooling.
-
-### Bulk AZ precompute
-
-The on-demand queue (`AzQueueDO`) is rate-limited to opentopodata's public
-budget (~1 req/s, 900 calls/day), so a summit you've never zoomed in on
-before can take a while to get its ring — and a whole under-visited region
-can outright exhaust the daily budget before working through its backlog.
-`scripts/bulk-az.ts` sidesteps this for a one-off backfill: it reads
-elevation directly from the public USGS 3DEP 1/3-arcsecond COGs on AWS via
-HTTP range requests (`scripts/lib/dem.ts`, using `geotiff.js` — no local
-DEM download, no server to run, no rate limit), computes rings locally, and
-writes straight into the real `AZ_CACHE` KV namespace. The live Worker
-then just serves what's already cached — no further computation needed.
-
-Only covers the continental US/Alaska (that's the 3DEP tileset's extent).
-Run it from your machine, not from a Worker:
-
-```sh
-npx tsx scripts/bulk-az.ts W6 W7O W7W [--limit N] [--concurrency N]
-```
-
-Notes:
-
-- Prefixes match the leading part of `SummitCode` (e.g. `W7` covers every
-  `W7*` region, `W7O` just that one). Pass as many as you like in one run.
-- Already-cached summits — success *or* a prior failure — are skipped, so
-  reruns are cheap and safe; only delete a KV entry first
-  (`npx wrangler kv key delete "az:<ref>" --namespace-id <id> --remote`) to
-  force a recompute.
-- `--concurrency` (default 8) is local HTTP range-request parallelism
-  against S3, unrelated to the live Worker's opentopodata budget — bump it
-  freely.
-- Takes a few ms/summit once DEM tiles are warm in the in-process cache;
-  sorted by DEM tile name first so neighboring summits hit the same tile
-  back-to-back. A run across a large, sparse region (thousands of summits)
-  still takes several minutes.
-- Requires `npx wrangler login` once (uses `wrangler kv key list`/
-  `bulk put` under the hood against the real namespace) — no `NREL_API_KEY`
-  or opentopodata access needed.
-
-## Deployment
-
-Prerequisites: Node 20+, a Cloudflare account with the Workers Paid plan
-(required for Durable Objects, and for the CPU time a 171k-row daily CSV
-parse needs), and a zone you control on Cloudflare for the custom domain.
-
-```sh
-npm install
-npx wrangler login                                  # once per machine
-npx wrangler r2 bucket create sota-wfs-data          # matches wrangler.jsonc's r2_buckets
-npx wrangler kv namespace create AZ_CACHE            # paste the returned id into wrangler.jsonc's kv_namespaces
-npx wrangler deploy
-```
-
-`wrangler.jsonc` pins the custom domain (`routes`), the two cron schedules,
-and the Durable Object migration — review it before deploying to a
-different account/domain.
-
-Optional, for a personal (non-`DEMO_KEY`) NREL rate limit on the
-Supercharger fetch:
-
-```sh
-npx wrangler secret put NREL_API_KEY   # production — prompts, never touches your shell history
-cp .dev.vars.example .dev.vars         # local `wrangler dev` — git-ignored
-```
-
-The Worker won't have data until its first successful fetch. Cron Triggers
-don't run on demand, so trigger the first one manually:
-
-```sh
-npx wrangler dev --test-scheduled --remote &
-curl "http://localhost:8787/__scheduled?cron=0+8+*+*+*"    # SOTA summits
-curl "http://localhost:8787/__scheduled?cron=0+9+*+*+1"    # Tesla Superchargers
-```
-
-(`--remote` here means the local dev process reads/writes the *real*
-deployed R2/KV/DO — this is the sanctioned way to test-fire a deployed
-Worker's scheduled handler; `/__scheduled` doesn't exist on the live
-production endpoint itself.)
-
-## Operations
-
-```sh
-npx wrangler tail                          # live logs from the deployed Worker
-npx wrangler deployments list              # deployment history
-npm test                                   # vitest suite (Miniflare-local, no network)
-npx tsx scripts/measure-tiling.ts          # real-CSV diagnostic (network, no writes)
-```
-
 ## CalTopo integration
 
 Public URL (stable, custom domain — you'll paste this into CalTopo, nothing
@@ -179,12 +24,12 @@ to install): `https://wfs.ke6mt.us`
   and a link to its SOTL.as page. Zoom in on a summit far enough that your
   visible map spans less than about 25 miles (40 km) top-to-bottom and a
   translucent orange **activation zone** ring appears — the area within 25
-  vertical meters of the true summit,
-  i.e. where you need to be standing to log a valid activation. That ring
-  is computed from elevation data the first time anyone views that summit
-  and cached forever after; if you're the first person to zoom in on a
-  given summit it can take a minute or two to show up — pan away and back,
-  or see [Troubleshooting](#troubleshooting) if it never does.
+  vertical meters of the true summit, i.e. where you need to be standing to
+  log a valid activation. That ring is computed from elevation data the
+  first time anyone views that summit and cached forever after; if you're
+  the first person to zoom in on a given summit it can take a minute or two
+  to show up — pan away and back, or see
+  [Troubleshooting](#troubleshooting) if it never does.
 - **Tesla Superchargers** — one marker per site; clicking it shows the
   address, DC fast-charge stall count, top connector power, and access
   hours.
@@ -257,6 +102,186 @@ in the **Your Overlays** picker on any map. Each "Save To Account" click
 creates a separate saved copy, so if you're experimenting with field
 choices, delete the old copy first (Your Data → Layers → row → ⓘ →
 DELETE) rather than accumulating duplicates.
+
+### Other apps (Gaia GPS, onX)
+
+Not supported today, and not a config issue on this end — neither app has
+anything comparable to CalTopo's live WFS source, so there's no URL to
+paste in for them:
+
+- **Gaia GPS** only accepts raster tile sources (TMS, or WMTS converted
+  from an ArcGIS REST endpoint). WMS/WFS data has to be pre-converted to
+  tiles with separate tools (QGIS + Mapbox Studio) before Gaia will take
+  it at all — not a "paste this URL" workflow, and the per-summit
+  click-to-see-popup behavior wouldn't survive being flattened into tiles
+  anyway.
+- **onX** doesn't expose any live external layer source. Its only import
+  path is a one-time GPX/KML file (capped at 4 MB / 3,000 markups) — a
+  snapshot you'd have to re-export and re-import by hand, not a
+  periodically-refreshing feed.
+
+If either of these becomes worth doing, the right fix is adding a small
+export endpoint to this Worker (e.g. `/summit/*.gpx`) you could
+re-download occasionally — not a client-side workaround.
+
+## Components
+
+- `src/index.ts` — Hono app: `/geoserver` WFS routes (`GetCapabilities`,
+  `GetFeature`, `DescribeFeatureType`), plus `/summit/<ref>.geojson` and
+  `/az/<ref>.geojson` single-record downloads.
+- `src/scheduled.ts` — Cron Trigger handler: fetches and validates the SOTA
+  summit list (daily) and Tesla Supercharger locations (weekly), then
+  publishes them. A bad fetch (wrong header, too few rows/features) is
+  never published — the previous good data keeps serving.
+- **R2** (`sota-wfs-data` bucket) — each publish writes a new version's
+  worth of bbox-tiled data (5°×5° tiles, `src/data/tiling.ts`) plus a
+  compact `code → tile` lookup index, under a fresh version prefix;
+  `current.json` is flipped last so a `GetFeature` request never observes a
+  half-written generation. Two generations back are pruned automatically.
+  A `GetFeature` with a BBOX (which is what CalTopo always sends) only
+  reads the handful of tiles the view overlaps — never the whole dataset.
+- **KV** (`AZ_CACHE` namespace) — one key per summit's cached activation-zone
+  ring. Computed once, served forever; see [Activation zones](#activation-zones-az)
+  below.
+- **Durable Object** (`AzQueueDO`) — the single global coordinator for AZ
+  polygon computation: a rate-limited (~1 req/s), daily-budgeted (900
+  calls) queue driven by alarms, replacing what used to be an in-process
+  thread in the old Python version.
+- `scripts/measure-tiling.ts` — local diagnostic: fetches the real SOTA CSV
+  and reports tile counts/sizes and a few data-shape sanity checks. Run
+  with `npx tsx scripts/measure-tiling.ts` before changing anything in
+  `src/data/` — the real dataset (~171k rows) is what forced several of
+  this project's design decisions (see git log).
+
+- `scripts/bulk-az.ts` — local bulk-precompute for AZ rings; see
+  [Bulk AZ precompute](#bulk-az-precompute) below.
+
+Not yet ported from the previous Python version: the offline
+SOTL.as-validation tool (`az_compare`). It never ran as part of the live
+service; the original is still available in git history before the
+Cloudflare Workers migration.
+
+## Layers served (namespace `sota`)
+
+| Typename | Fields (popup subset in bold) |
+|---|---|
+| `sota:SOTA_Summits` | All 17 summit-list columns plus **`SOTLAS`** (link to <https://sotl.as>) and **`Activations`** (activation count as a string, so "0" still displays) |
+| `sota:Tesla_Superchargers` | **`title`**, **`address`**, **`stalls`**, **`power_kw`**, **`access`**, plus `street`, `city`, `state`, `zip`, `connectors`, `pricing`, `phone` |
+
+Supercharger field notes: `stalls` = DC fast-charge stall count, `power_kw` =
+highest connector power at the site, `access` = hours plus NACS notes. The
+extra columns are served but omitted from the CalTopo templates above — any
+future template can re-include them via `PROPERTYNAME` without code changes.
+
+### Activation zones (AZ)
+
+SOTA summit points can carry an AZ polygon (the area within 25 vertical
+meters of the summit). Rings are computed from a coarse bound
+(api.activation.zone) plus a fine elevation grid (opentopodata), and are
+**only ever computed once per summit**: a successful ring is cached in KV
+permanently and never recomputed, since a summit's terrain doesn't change.
+A failed computation is retried after 7 days. Polygons are only served
+when the map is zoomed in enough (bbox lat span < 0.4°); a cache miss is
+queued to `AzQueueDO` and appears on a later pan/refresh — never computed
+synchronously in the request path, since the elevation API is slow and
+rate-limited.
+
+There's currently no automatic invalidation if a summit's official
+coordinates/altitude change in the SOTA database — a real gap, but a rare
+one (on the order of a handful of summits a year), and not yet worth the
+tooling.
+
+### Bulk AZ precompute
+
+The on-demand queue (`AzQueueDO`) is rate-limited to opentopodata's public
+budget (~1 req/s, 900 calls/day), so a summit you've never zoomed in on
+before can take a while to get its ring — and a whole under-visited region
+can outright exhaust the daily budget before working through its backlog.
+`scripts/bulk-az.ts` sidesteps this for a one-off backfill: it reads
+elevation directly from the public USGS 3DEP 1/3-arcsecond COGs on AWS via
+HTTP range requests (`scripts/lib/dem.ts`, using `geotiff.js` — no local
+DEM download, no server to run, no rate limit), computes rings locally, and
+writes straight into the real `AZ_CACHE` KV namespace. The live Worker
+then just serves what's already cached — no further computation needed.
+
+Only covers the continental US/Alaska (that's the 3DEP tileset's extent).
+Run it from your machine, not from a Worker:
+
+```sh
+npx tsx scripts/bulk-az.ts W6 W7O W7W [--limit N] [--concurrency N]
+```
+
+Notes:
+
+- Prefixes match the leading part of `SummitCode` (e.g. `W7` covers every
+  `W7*` region, `W7O` just that one). Pass as many as you like in one run.
+- Already-cached summits — success *or* a prior failure — are skipped, so
+  reruns are cheap and safe; only delete a KV entry first
+  (`npx wrangler kv key delete "az:<ref>" --namespace-id <id> --remote`) to
+  force a recompute.
+- `--concurrency` (default 8) is local HTTP range-request parallelism
+  against S3, unrelated to the live Worker's opentopodata budget — bump it
+  freely.
+- Takes a few ms/summit once DEM tiles are warm in the in-process cache;
+  sorted by DEM tile name first so neighboring summits hit the same tile
+  back-to-back. A run across a large, sparse region (thousands of summits)
+  still takes several minutes.
+- Requires `npx wrangler login` once (uses `wrangler kv key list`/
+  `bulk put` under the hood against the real namespace) — no `NREL_API_KEY`
+  or opentopodata access needed.
+- Occasionally one of the `wrangler kv` subprocess calls fails with
+  `Authentication error [code: 10000]` even with a valid, working login —
+  a known wrangler OAuth-token-refresh race, not a real credential problem.
+  Just rerun; already-cached summits are skipped so nothing is repeated.
+
+## Deployment
+
+Prerequisites: Node 20+, a Cloudflare account with the Workers Paid plan
+(required for Durable Objects, and for the CPU time a 171k-row daily CSV
+parse needs), and a zone you control on Cloudflare for the custom domain.
+
+```sh
+npm install
+npx wrangler login                                  # once per machine
+npx wrangler r2 bucket create sota-wfs-data          # matches wrangler.jsonc's r2_buckets
+npx wrangler kv namespace create AZ_CACHE            # paste the returned id into wrangler.jsonc's kv_namespaces
+npx wrangler deploy
+```
+
+`wrangler.jsonc` pins the custom domain (`routes`), the two cron schedules,
+and the Durable Object migration — review it before deploying to a
+different account/domain.
+
+Optional, for a personal (non-`DEMO_KEY`) NREL rate limit on the
+Supercharger fetch:
+
+```sh
+npx wrangler secret put NREL_API_KEY   # production — prompts, never touches your shell history
+cp .dev.vars.example .dev.vars         # local `wrangler dev` — git-ignored
+```
+
+The Worker won't have data until its first successful fetch. Cron Triggers
+don't run on demand, so trigger the first one manually:
+
+```sh
+npx wrangler dev --test-scheduled --remote &
+curl "http://localhost:8787/__scheduled?cron=0+8+*+*+*"    # SOTA summits
+curl "http://localhost:8787/__scheduled?cron=0+9+*+*+1"    # Tesla Superchargers
+```
+
+(`--remote` here means the local dev process reads/writes the *real*
+deployed R2/KV/DO — this is the sanctioned way to test-fire a deployed
+Worker's scheduled handler; `/__scheduled` doesn't exist on the live
+production endpoint itself.)
+
+## Operations
+
+```sh
+npx wrangler tail                          # live logs from the deployed Worker
+npx wrangler deployments list              # deployment history
+npm test                                   # vitest suite (Miniflare-local, no network)
+npx tsx scripts/measure-tiling.ts          # real-CSV diagnostic (network, no writes)
+```
 
 ## Verification
 
