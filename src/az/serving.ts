@@ -31,8 +31,17 @@ export interface AzEnqueueItem {
 
 export type Enqueue = (items: AzEnqueueItem[]) => void;
 
-function azKey(ref: string): string {
+export function azKey(ref: string): string {
   return `az:${ref}`;
+}
+
+/** True when a ref already has a successful cached ring — e.g. from a
+ * bulk-precompute run (scripts/bulk-az.ts) that landed while it was still
+ * sitting in the on-demand queue. Lets the queue skip it for free instead
+ * of spending budget recomputing something already solved. */
+export async function isAlreadyCached(kv: KVNamespace, ref: string): Promise<boolean> {
+  const entry = await kv.get<AzCacheEntry>(azKey(ref), "json");
+  return entry?.ok === true;
 }
 
 function liveOrNull(entry: AzCacheEntry | null): AzCacheEntry | null {

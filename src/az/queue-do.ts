@@ -7,7 +7,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 import { computeAz } from "./compute";
-import { writeCache } from "./serving";
+import { writeCache, isAlreadyCached } from "./serving";
 
 const DAILY_CALL_BUDGET = 900; // opentopodata public limit is 1000 calls/day
 const RATE_LIMIT_MS = 1100;
@@ -51,6 +51,16 @@ export class AzQueueDO extends DurableObject<Env> {
     }
   }
 
+  /** Read-only introspection for debugging — not exposed publicly, just
+   * callable from an ops script/temporary route. */
+  async debugState(): Promise<{ pending: QueueItem[]; budget: Budget | null; nextAlarm: number | null }> {
+    return {
+      pending: (await this.ctx.storage.get<QueueItem[]>("pending")) ?? [],
+      budget: (await this.ctx.storage.get<Budget>("budget")) ?? null,
+      nextAlarm: await this.ctx.storage.getAlarm(),
+    };
+  }
+
   private async budgetOk(): Promise<boolean> {
     const budget = await this.ctx.storage.get<Budget>("budget");
     return !budget || budget.day !== today() || budget.calls < DAILY_CALL_BUDGET;
@@ -76,13 +86,19 @@ export class AzQueueDO extends DurableObject<Env> {
     const [item, ...rest] = pending as [QueueItem, ...QueueItem[]];
     await this.ctx.storage.put("pending", rest);
 
-    try {
-      const ring = await computeAz(item.ref, item.lat, item.lon, item.alt, (n) => this.spend(n));
-      await writeCache(this.env.AZ_CACHE, item.ref, { ok: ring !== null, ring: ring ?? undefined });
-      if (ring) console.log(`az: ${item.ref} cached (${ring.length} pts)`);
-    } catch (exc) {
-      console.log(`az: ${item.ref} failed: ${exc}`);
-      await writeCache(this.env.AZ_CACHE, item.ref, { ok: false, error: String(exc) });
+    if (await isAlreadyCached(this.env.AZ_CACHE, item.ref)) {
+      // e.g. a bulk-precompute run (scripts/bulk-az.ts) landed while this
+      // was still sitting in the queue — don't spend budget redoing it.
+      console.log(`az: ${item.ref} already cached, skipping`);
+    } else {
+      try {
+        const ring = await computeAz(item.ref, item.lat, item.lon, item.alt, (n) => this.spend(n));
+        await writeCache(this.env.AZ_CACHE, item.ref, { ok: ring !== null, ring: ring ?? undefined });
+        if (ring) console.log(`az: ${item.ref} cached (${ring.length} pts)`);
+      } catch (exc) {
+        console.log(`az: ${item.ref} failed: ${exc}`);
+        await writeCache(this.env.AZ_CACHE, item.ref, { ok: false, error: String(exc) });
+      }
     }
 
     if (rest.length > 0) {

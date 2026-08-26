@@ -186,6 +186,14 @@ app.get("/wfs", wfsHandler);
 app.get("/geoserver/wfs", wfsHandler);
 app.get("/geoserver/:ns/wfs", wfsHandler);
 
+// Read-only ops introspection: queue depth, today's opentopodata call
+// budget, and the next scheduled alarm — nothing sensitive, just useful
+// for diagnosing "why hasn't this summit's AZ shown up yet."
+app.get("/debug/az-queue", async (c) => {
+  const stub = c.env.AZ_QUEUE.get(c.env.AZ_QUEUE.idFromName("global"));
+  return json(await stub.debugState());
+});
+
 app.get("/az/:refExt", async (c) => {
   const refExt = c.req.param("refExt");
   if (!refExt.endsWith(".geojson")) return c.notFound();
