@@ -163,15 +163,46 @@ Cloudflare Workers migration.
 
 ## Layers served (namespace `sota`)
 
-| Typename | Fields (popup subset in bold) |
-|---|---|
-| `sota:SOTA_Summits` | All 17 summit-list columns plus **`SOTLAS`** (link to <https://sotl.as>) and **`Activations`** (activation count as a string, so "0" still displays) |
-| `sota:Tesla_Superchargers` | **`title`**, **`address`**, **`stalls`**, **`power_kw`**, **`access`**, plus `street`, `city`, `state`, `zip`, `connectors`, `pricing`, `phone` |
+The CalTopo templates above only request a subset of fields to keep popups
+short; every field below is available to any `PROPERTYNAME` list (or drop
+`PROPERTYNAME` entirely to get all of them).
 
-Supercharger field notes: `stalls` = DC fast-charge stall count, `power_kw` =
-highest connector power at the site, `access` = hours plus NACS notes. The
-extra columns are served but omitted from the CalTopo templates above — any
-future template can re-include them via `PROPERTYNAME` without code changes.
+### `sota:SOTA_Summits`
+
+| Field | Description |
+|---|---|
+| `SummitCode` | Unique summit reference, e.g. `W6/CT-123` |
+| `AssociationName` | e.g. "USA-California" |
+| `RegionName` | Sub-region within the association |
+| `SummitName` | Human-readable name |
+| `AltM` / `AltFt` | Elevation, meters / feet |
+| `Longitude` / `Latitude` | Coordinates as plain attributes (in addition to the point geometry) |
+| `GridRef1` / `GridRef2` | Raw grid-reference columns from the source CSV |
+| `Points` / `BonusPoints` | SOTA point value / winter bonus points |
+| `ValidFrom` / `ValidTo` | Date window the summit counts for activation credit |
+| `ActivationCount` | Times activated, as a number (blank, not `0`, when never activated) |
+| `ActivationDate` | Most recent activation date |
+| `ActivationCall` | Callsign of the most recent activation |
+| `title` | *Derived* — same as `SummitName`; CalTopo's default marker label |
+| `SOTLAS` | *Derived* — link to the summit's [sotl.as](https://sotl.as) page |
+| `Activations` | *Derived* — activation count as a string, so "0" still displays (unlike `ActivationCount`, which is blank) |
+| `marker-color` | *Derived* — color keyed to point value, green (1 pt) to red (10 pt) |
+| `marker-symbol` | *Derived* — numbered circle icon keyed to point value |
+
+### `sota:Tesla_Superchargers`
+
+| Field | Description |
+|---|---|
+| `title` | Station name |
+| `address` | Street, city, and state combined |
+| `street` / `city` / `state` / `zip` | Individual address components |
+| `stalls` | DC fast-charge stall count |
+| `power_kw` | Highest connector power at the site (kW) |
+| `connectors` | Connector types available |
+| `pricing` | Pricing info, as reported by NREL |
+| `access` | Access hours / notes |
+| `phone` | Station phone number |
+| `marker-color` / `marker-symbol` | Fixed styling (orange charging icon) |
 
 ### Activation zones (AZ)
 
