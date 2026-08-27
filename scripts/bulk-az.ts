@@ -94,6 +94,33 @@ async function flushToKv(entries: { key: string; value: string }[]): Promise<voi
   }
 }
 
+const COVERAGE_PROBE_SIZE = 20;
+
+/** True when this scope looks like it has real USGS 3DEP coverage. Checks
+ * a small sample before doing any real work — a run against a non-US
+ * prefix (e.g. the England incident: bulk-az.ts G wrote 1620 permanent
+ * "no DEM coverage" failures into the shared AZ_CACHE before anyone
+ * noticed, blocking the live on-demand queue's opentopodata path — which
+ * *does* have real coverage there — for 7 days each) writes nothing to
+ * the cache instead of silently poisoning it. A single US summit hitting
+ * this exact failure is effectively unheard of (see git history — every
+ * real US bulk run so far has failed on other summits for other reasons,
+ * never this one), so requiring the *whole* sample to fail this way
+ * before aborting leaves no realistic false-positive risk.
+ */
+async function probeCoverage(
+  dem: Dem,
+  sample: { lat: number; lon: number; alt: number }[],
+): Promise<boolean> {
+  if (sample.length === 0) return true;
+  let noCoverage = 0;
+  for (const item of sample) {
+    const result = await computeOneLocal(dem, item.lat, item.lon, item.alt);
+    if (!result.ok && result.error?.includes("no DEM coverage")) noCoverage++;
+  }
+  return noCoverage < sample.length;
+}
+
 async function runPool<T>(items: T[], concurrency: number, worker: (item: T) => Promise<void>): Promise<void> {
   let next = 0;
   async function runner(): Promise<void> {
@@ -144,6 +171,20 @@ async function main(): Promise<void> {
   if (total === 0) return;
 
   const dem = new Dem();
+
+  console.log(`bulk_az: probing DEM coverage (${Math.min(COVERAGE_PROBE_SIZE, total)} summits)...`);
+  const covered = await probeCoverage(dem, todo.slice(0, COVERAGE_PROBE_SIZE));
+  if (!covered) {
+    console.error(
+      `bulk_az: no USGS 3DEP coverage detected for this scope — every probed summit failed with ` +
+        `"no DEM coverage". This tool only works for the US (3DEP's extent); aborting without ` +
+        `writing anything to the cache. If this scope genuinely includes US territory, rerun with ` +
+        `--limit to isolate which prefix is out of coverage.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
   let pending: { key: string; value: string }[] = [];
   let done = 0;
   let failed = 0;
